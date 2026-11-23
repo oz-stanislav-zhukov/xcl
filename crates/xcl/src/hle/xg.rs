@@ -695,14 +695,37 @@ unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, su
 }
 
 /// the level's place in `src` (the whole resource) → rows of `dst` (`row_pitch` apart)
-unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
+unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch_raw: usize, slice_pitch_raw: usize) -> HRESULT {
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    let pitch = row_pitch_raw as u32 as usize;
+    let slice_pitch = slice_pitch_raw as u32 as usize;
+    let last_off = m.height.saturating_sub(1).checked_mul(pitch).and_then(|o| o.checked_add(row));
+    let dst_ok = pitch >= row
+        && last_off.is_some_and(|span| {
+            span <= (256 << 20)
+                && (dst as usize).checked_add(span).is_some()
+                && crate::gpu::shader::readable(dst as usize, 1)
+                && crate::gpu::shader::readable((dst as usize) + span.saturating_sub(1), 1)
+        });
+    if !dst_ok {
+        if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_warn!(
+                "xg: CopyFromSubresource bad dst span: dst={dst:p} plane={plane} sub={sub} src={src:p} arg5={row_pitch_raw:#x} arg6={slice_pitch_raw:#x} (row={row:#x}, h={}, depth={}, bpe={}, mode={:#x})",
+                m.height,
+                t.depth,
+                t.bpe,
+                t.mode
+            );
+        }
+        return E_INVALIDARG;
+    }
     if t.depth > 0 {
         let linear = t.chain.detile_volume(std::slice::from_raw_parts(src.add(at as usize), t.size() as usize), i);
         for (n, from) in linear.chunks_exact(row).enumerate() {
-            let to = n / m.height * slice_pitch as usize + n % m.height * row_pitch as usize;
+            let to = n / m.height * slice_pitch + n % m.height * pitch;
             std::ptr::copy_nonoverlapping(from.as_ptr(), dst.add(to), row);
         }
         return S_OK;
@@ -710,7 +733,7 @@ unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, su
     let slice = std::slice::from_raw_parts(src.add(at as usize + k * t.chain.slice_bytes), t.chain.slice_bytes);
     let linear = t.chain.detile_level(slice, i, k);
     for y in 0..m.height {
-        std::ptr::copy_nonoverlapping(linear[y * row..].as_ptr(), dst.add(y * row_pitch as usize), row);
+        std::ptr::copy_nonoverlapping(linear[y * row..].as_ptr(), dst.add(y * pitch), row);
     }
     S_OK
 }

@@ -105,6 +105,9 @@ fn block(pc: u64, mut text: String, flow: emit::Flow) -> Result<Block, String> {
 /// temporaries (every instruction numbers them from t1).
 fn inst_text(em: &mut emit::Em, d: &rdna2::Decoded, next: u64) -> (String, emit::Flow) {
     em.reset_temps();
+    if em.skip.contains(&d.pc) {
+        return (String::new(), emit::Flow::Next);
+    }
     let flow = em.inst(d, next);
     let temps = em.reset_temps();
     let mut s = String::new();

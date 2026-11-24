@@ -1749,7 +1749,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
         body.push_str(&code);
     }
-    let hlsl = em.finish(&body);
+    let hlsl = em.finish(&body, insts.len());
     let static_samplers = em.static_used.clone();
     Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
 }

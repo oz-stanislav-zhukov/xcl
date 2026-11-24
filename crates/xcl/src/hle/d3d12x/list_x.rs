@@ -1048,8 +1048,11 @@ struct SyncCell {
     /// Queue that issued the latest GPU `Signal` (`None` if released on CPU).
     submitted_queue: Option<usize>,
     /// Highest value explicitly released on CPU (cycle-break or watchdog). Protects against
-    /// vkd3d-proton rewinding `fence->virtual_value` when an older in-flight GPU signal retires.
+    /// a fence rewinding when an older in-flight GPU signal retires.
     cpu_signaled_max: u64,
+    /// Highest `GetCompletedValue()` observed on `fence` so native D3D12 multi-queue fence
+    /// rewinds (an older `queue.Signal(v - 1)` retiring after `v`) are detected and repaired.
+    highest_completed: u64,
     /// Set once a strictly decreasing write (`value < submitted_max`) is observed at this VA,
     /// disabling GPU-fence bridging and falling back to CPU polling.
     non_monotonic: bool,
@@ -1088,11 +1091,35 @@ impl SyncGraph {
 static SYNC_GRAPH: Mutex<Option<SyncGraph>> = Mutex::new(None);
 static ARMED_GPU_WAITS: AtomicUsize = AtomicUsize::new(0);
 static SYNC_WATCHDOG_WAKE: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
+/// Keeps `xcl-sync-watchdog` polling briefly after any CPU release or rewind repair even once
+/// `ARMED_GPU_WAITS` drops to 0, so older in-flight GPU `Signal`s that retire right after a CPU
+/// `fence.Signal` cannot leave the fence rewound while the watchdog is asleep on `cv.wait`.
+static REWIND_GUARD_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 static QUEUE_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// Write64 Signals signalled on the CPU to break a cycle so far (the first 32 are logged).
 static BREAK_WARN: AtomicU64 = AtomicU64::new(0);
 /// Cells the watchdog released on the CPU so far.
 static WATCHDOG_RELEASES: AtomicU64 = AtomicU64::new(0);
+
+fn arm_rewind_guard() {
+    let until = Instant::now() + Duration::from_secs(10);
+    let mut g = REWIND_GUARD_UNTIL.lock().unwrap();
+    if g.is_none_or(|prev| until > prev) {
+        *g = Some(until);
+    }
+}
+
+fn rewind_guard_active() -> bool {
+    let mut g = REWIND_GUARD_UNTIL.lock().unwrap();
+    match *g {
+        Some(until) if Instant::now() < until => true,
+        Some(_) => {
+            *g = None;
+            false
+        }
+        None => false,
+    }
+}
 
 fn queue_id(q: usize) -> usize {
     let mut g = QUEUE_IDS.lock().unwrap();
@@ -1109,7 +1136,7 @@ fn queue_id(q: usize) -> usize {
 /// was removed). Returns the fence's current completed value (or `0` if no fence exists yet).
 unsafe fn prune_completed_waits(cell: &mut SyncCell) -> u64 {
     let Some(ref fence) = cell.fence else { return 0 };
-    let completed = fence.GetCompletedValue();
+    let mut completed = fence.GetCompletedValue();
     if completed == u64::MAX {
         let removed = cell.armed_waits.len();
         cell.armed_waits.clear();
@@ -1118,6 +1145,18 @@ unsafe fn prune_completed_waits(cell: &mut SyncCell) -> u64 {
             ARMED_GPU_WAITS.fetch_sub(removed, Ordering::AcqRel);
         }
         return completed;
+    }
+    let floor = cell.cpu_signaled_max.max(cell.highest_completed);
+    if completed < floor {
+        static REWIND_WARN: AtomicU64 = AtomicU64::new(0);
+        if once(&REWIND_WARN, 16) {
+            crate::xlog_warn!("D3D12.X: Write64 fence rewound from {floor:#x} to {completed:#x} – restoring on CPU");
+        }
+        let _ = fence.Signal(floor);
+        completed = floor;
+        arm_rewind_guard();
+    } else if completed > cell.highest_completed {
+        cell.highest_completed = completed;
     }
     if !cell.armed_waits.is_empty() {
         let before = cell.armed_waits.len();
@@ -1349,6 +1388,10 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
         }
         out
     };
+    if !to_release.is_empty() {
+        arm_rewind_guard();
+        wake_sync_watchdog();
+    }
     for (va, val, fence) in to_release {
         let _ = fence.Signal(val);
         static MIXED_WARN: AtomicU64 = AtomicU64::new(0);
@@ -1494,11 +1537,13 @@ fn wake_sync_watchdog() {
         let _ = std::thread::Builder::new().name("xcl-sync-watchdog".into()).spawn(|| loop {
             let (lock, cv) = SYNC_WATCHDOG_WAKE.get().unwrap();
             let guard = lock.lock().unwrap();
-            if ARMED_GPU_WAITS.load(Ordering::Acquire) == 0 {
+            let armed = ARMED_GPU_WAITS.load(Ordering::Acquire);
+            if armed == 0 && !rewind_guard_active() {
                 let _g = cv.wait(guard).unwrap();
                 continue;
             }
-            let _ = cv.wait_timeout(guard, Duration::from_millis(50)).unwrap();
+            let poll = if armed == 0 { Duration::from_millis(20) } else { Duration::from_millis(50) };
+            let _ = cv.wait_timeout(guard, poll).unwrap();
             let (expired, rewinds, in_flight) = {
                 let mut g = SYNC_GRAPH.lock().unwrap();
                 let mut out: Vec<(u64, u64, ID3D12Fence, usize, i32, Option<usize>, Option<i32>, u64, u64, u64)> = Vec::new();
@@ -1511,18 +1556,19 @@ fn wake_sync_watchdog() {
                         in_flight = Some(unsafe { calls_in_flight(graph) });
                     }
                     for (&va, cell) in graph.cells.iter_mut() {
-                        if cell.armed_waits.is_empty() && cell.cpu_signaled_max == 0 {
+                        if cell.armed_waits.is_empty() && cell.cpu_signaled_max == 0 && cell.highest_completed == 0 {
                             continue;
                         }
                         let completed = unsafe { prune_completed_waits(cell) };
                         if completed == u64::MAX {
                             continue;
                         }
-                        // Guard against vkd3d-proton rewinding `fence->virtual_value` when an older
-                        // in-flight GPU signal retires after a CPU cycle-break/watchdog signal.
-                        if cell.cpu_signaled_max > completed {
+                        // Guard against a fence rewinding when an older in-flight GPU signal
+                        // retires after a CPU release or higher GPU completion.
+                        let floor = cell.cpu_signaled_max.max(cell.highest_completed);
+                        if floor > completed {
                             if let Some(ref f) = cell.fence {
-                                rew.push((f.clone(), cell.cpu_signaled_max));
+                                rew.push((f.clone(), floor));
                             }
                         }
                         if cell.armed_waits.is_empty() {
@@ -1571,12 +1617,18 @@ fn wake_sync_watchdog() {
             };
             // (the tile-mapping queue's fences as they are before the releases below)
             let sparse = in_flight.as_ref().map(|_| super::sparse::fence_status());
+            if !rewinds.is_empty() {
+                arm_rewind_guard();
+            }
             for (fence, val) in rewinds {
                 unsafe {
                     let _ = fence.Signal(val);
                 }
             }
             let had_expired = !expired.is_empty();
+            if had_expired {
+                arm_rewind_guard();
+            }
             let waiters: Vec<usize> = expired.iter().map(|e| e.3).collect();
             let earlier_releases = WATCHDOG_RELEASES.fetch_add(waiters.len() as u64, Ordering::Relaxed);
             for (va, val, fence, waiter_q, waiter_ty, prod_q, prod_ty, rec, sub, done) in expired {
@@ -1803,6 +1855,8 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
             }
             SignalAction::CpuCycleBreak(waiters) => {
                 let _ = fence.Signal(val);
+                arm_rewind_guard();
+                wake_sync_watchdog();
                 if once(&BREAK_WARN, 32) {
                     let sq = queue_id(sig_q);
                     let mut wids: Vec<String> = waiters
@@ -6483,6 +6537,82 @@ mod tests {
             assert_eq!(gpu_va(std::ptr::null_mut(), va, bytes, "test vertex buffer", true), first);
             // the range stays reserved (and unreadable): the mirror table is never emptied, so its
             // address must not come back for another test's memory
+        }
+    }
+
+    /// Reproduces a fence rewind after a higher GPU completion or CPU release:
+    /// 1. `prune_completed_waits` restores a fence that dropped below `highest_completed`.
+    /// 2. `xcl-sync-watchdog` stays awake via `REWIND_GUARD_UNTIL` and repairs a rewound cell
+    ///    even when `ARMED_GPU_WAITS == 0` (the state right after a CPU cycle-break or watchdog
+    ///    release clears the last armed wait).
+    #[test]
+    fn sync_watchdog_and_prune_repair_fence_rewind_with_zero_armed_waits() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+
+            // 1. Direct `prune_completed_waits` check: fence dropped below `highest_completed`.
+            let f_prune: ID3D12Fence = dev.CreateFence(4, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let mut local_cell = SyncCell {
+                fence: Some(f_prune.clone()),
+                device: dev.as_raw() as usize,
+                highest_completed: 7,
+                ..Default::default()
+            };
+            let repaired = prune_completed_waits(&mut local_cell);
+            assert_eq!(repaired, 7, "prune_completed_waits must return restored floor");
+            assert_eq!(f_prune.GetCompletedValue(), 7, "fence must be restored to highest_completed");
+
+            // 2. Watchdog check with `armed_waits` empty: an older GPU Signal left the fence at 9
+            //    after a CPU release to 10. Without the rewind guard, the watchdog sleeps forever
+            //    on `cv.wait` once `ARMED_GPU_WAITS == 0`.
+            let f_watch: ID3D12Fence = dev.CreateFence(9, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let cell_slot = Box::new(AtomicU64::new(0));
+            let va = &*cell_slot as *const AtomicU64 as u64;
+            {
+                let mut g = SYNC_GRAPH.lock().unwrap();
+                let gr = g.get_or_insert_with(SyncGraph::default);
+                gr.cells.insert(
+                    va,
+                    SyncCell {
+                        fence: Some(f_watch.clone()),
+                        device: dev.as_raw() as usize,
+                        cpu_signaled_max: 10,
+                        highest_completed: 10,
+                        ..Default::default()
+                    },
+                );
+            }
+            arm_rewind_guard();
+            wake_sync_watchdog();
+
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while f_watch.GetCompletedValue() < 10 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let final_val = f_watch.GetCompletedValue();
+
+            if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
+                gr.cells.remove(&va);
+            }
+            assert!(final_val >= 10, "sync watchdog did not repair rewound fence (still at {final_val})");
         }
     }
 }

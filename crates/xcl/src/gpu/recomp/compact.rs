@@ -220,7 +220,7 @@ fn compact(code: &[u8], opt: &Options, heavy: usize) -> Result<Translation, Stri
     // loop and runs what follows.
     let _ = writeln!(body, "        if (xcl_nb <= xcl_b) {{ {LOOP_GUARD} }}");
     body.push_str("        xcl_b = xcl_nb;\n    }\n");
-    let hlsl = em.finish(&body);
+    let hlsl = em.finish(&body, insts.len());
     let static_samplers = em.static_used.clone();
     Ok(Translation {
         hlsl,

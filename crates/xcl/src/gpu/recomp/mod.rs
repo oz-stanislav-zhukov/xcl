@@ -1477,7 +1477,6 @@ fn prepare(code: &[u8], opt: &Options) -> Result<Prepared, String> {
     } else {
         opt
     };
-    let program = code;
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {
@@ -1547,6 +1546,7 @@ fn prepare(code: &[u8], opt: &Options) -> Result<Prepared, String> {
 }
 
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    let program = code;
     let Prepared { insts, starts, leaders, branches, gs_jump, mut em } = prepare(code, opt)?;
     let mut body = String::new();
     let mut blocks = 0usize;

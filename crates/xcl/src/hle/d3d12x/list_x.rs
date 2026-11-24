@@ -1592,6 +1592,7 @@ fn wake_sync_watchdog() {
             }
             if had_expired {
                 crate::xlog_warn!("D3D12.X: pending title ID3D12Fences during GPU wait timeout: {}", super::fence_x::pending_summary());
+                super::culprit::on_watchdog_release();
             }
             if let Some(chain) = in_flight.and_then(|(waits, signals)| wait_chain_line(&waits, &signals, &waiters)) {
                 *WAIT_CHAIN_LOGGED.lock().unwrap() = Some(Instant::now());

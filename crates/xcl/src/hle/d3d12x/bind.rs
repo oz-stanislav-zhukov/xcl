@@ -311,7 +311,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
             }
             count(if gfx { DRAWS } else { DISPATCHES });
+            // an indirect dispatch: its groups are in the argument buffer (`max` of them)
+            let mark = if gfx { 0 } else { super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [0, 0, max]) };
             pc(this, sig, max, args, args_off, count_buf, count_off);
+            super::culprit::after_dispatch(list, mark);
             if clamped.is_some() {
                 super::clamp::done(list);
             }
@@ -892,7 +895,9 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     // more groups in X than D3D12 takes: folded (`recomp::IO_GROUP_LIMIT`)
     let (limit, [x, y, z]) = fold(x, y, z);
     bind_abi(this, list, pso, false, limit)?;
+    let mark = super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [x, y, z]);
     list.Dispatch(x, y, z);
+    super::culprit::after_dispatch(list, mark);
     Ok(())
 }
 

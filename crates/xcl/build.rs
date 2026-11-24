@@ -10,6 +10,7 @@ const TRANSLATOR_SOURCES: &[&str] = &[
     "src/gpu/rdna2.rs",
     "src/gpu/rdna2_spec.rs",
     "src/gpu/rdna2_xbox.rs",
+    "src/gpu/recomp/compact.rs",
     "src/gpu/recomp/dxc.rs",
     "src/gpu/recomp/emit.rs",
     "src/gpu/recomp/mesh_wave.rs",

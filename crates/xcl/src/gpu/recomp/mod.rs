@@ -1388,6 +1388,76 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> B
     out
 }
 
+/// `XCL_COMPACT_CS`: which compute programs go through the compact backend (`compact`):
+/// unset / `auto` the ones it wants (`compact::compact_wanted`), `0` none, `1` all. Read once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactCs {
+    Auto,
+    Never,
+    Always,
+}
+
+impl CompactCs {
+    fn parse(v: Option<&str>) -> Option<CompactCs> {
+        match v.map(str::trim) {
+            None | Some("auto") => Some(CompactCs::Auto),
+            Some("0") => Some(CompactCs::Never),
+            Some("1") => Some(CompactCs::Always),
+            Some(_) => None,
+        }
+    }
+
+    pub fn get() -> CompactCs {
+        static S: std::sync::OnceLock<CompactCs> = std::sync::OnceLock::new();
+        *S.get_or_init(|| {
+            let v = std::env::var("XCL_COMPACT_CS").ok();
+            CompactCs::parse(v.as_deref()).unwrap_or_else(|| {
+                crate::xlog_warn!("[SHADER] XCL_COMPACT_CS={:?} is not auto / 0 / 1 – auto", v.unwrap_or_default());
+                CompactCs::Auto
+            })
+        })
+    }
+
+    /// Whether the compute program `code` goes through the compact backend.
+    pub fn takes(self, code: &[u8]) -> bool {
+        match self {
+            CompactCs::Auto => compact::compact_wanted(code),
+            CompactCs::Never => false,
+            CompactCs::Always => true,
+        }
+    }
+}
+
+/// `translate`, but a compute program goes through the compact backend where `XCL_COMPACT_CS`
+/// says so (`CompactCs`); where that fails or leaves instructions out, through `translate`.
+pub fn translate_routed(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    translate_as(code, opt, CompactCs::get()).map(|(t, _)| t)
+}
+
+/// `translate_routed` with the switch given, and whether the translation is the compact form.
+pub(super) fn translate_as(code: &[u8], opt: &Options, cs: CompactCs) -> Result<(Translation, bool), String> {
+    if matches!(opt.mode, Mode::Compute(_)) && cs.takes(code) {
+        match compact::translate_compact(code, opt) {
+            Ok(t) if t.complete() => {
+                note_compact(code, || format!("{} instructions, {} B HLSL", t.instructions, t.hlsl.len()));
+                return Ok((t, true));
+            }
+            Ok(t) => note_compact(code, || format!("incomplete (missing {:?}) – translated as before", t.unsupported.keys().collect::<Vec<_>>())),
+            Err(e) => note_compact(code, || format!("{e} – translated as before")),
+        }
+    }
+    translate(code, opt).map(|t| (t, false))
+}
+
+/// One INFO line per compute program the compact backend got, the first time.
+fn note_compact(code: &[u8], what: impl FnOnce() -> String) {
+    static SEEN: std::sync::Mutex<BTreeSet<u64>> = std::sync::Mutex::new(BTreeSet::new());
+    let h = super::shader::fnv64(code);
+    if SEEN.lock().unwrap().insert(h) {
+        crate::xlog_info!("[SHADER] compact backend, compute program {h:016x}: {}", what());
+    }
+}
+
 /// A decoded program, its block leaders and the emitter set up for it (`translate`,
 /// `compact::translate_compact`).
 struct Prepared {
@@ -1528,6 +1598,52 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let hlsl = em.finish(&body);
     let static_samplers = em.static_used.clone();
     Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
+}
+
+#[cfg(test)]
+mod compact_cs_tests {
+    use super::*;
+
+    #[test]
+    fn the_switch_reads_auto_0_and_1() {
+        assert_eq!(CompactCs::parse(None), Some(CompactCs::Auto));
+        assert_eq!(CompactCs::parse(Some("auto")), Some(CompactCs::Auto));
+        assert_eq!(CompactCs::parse(Some("0")), Some(CompactCs::Never));
+        assert_eq!(CompactCs::parse(Some(" 1 ")), Some(CompactCs::Always));
+        assert_eq!(CompactCs::parse(Some("yes")), None);
+        assert_eq!(CompactCs::parse(Some("")), None);
+        assert!(!CompactCs::Never.takes(&[0; 8]));
+        assert!(CompactCs::Always.takes(&[0; 8]));
+        assert_eq!(CompactCs::Auto.takes(&[0; 8]), compact::compact_wanted(&[0; 8]));
+    }
+
+    /// Only compute programs are routed, and a compact result that fails falls back to `translate`.
+    #[test]
+    fn only_compute_goes_to_the_compact_backend() {
+        // a program with a branch: its compact form is complete and differs from `translate`'s
+        // in both modes, so only the mode decides which of the two is routed
+        let mut code = rdna2::encode("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap();
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let cs = CsInterface::from_rsrc2([64, 1, 1], 0);
+        for mode in [Mode::Kernel, Mode::Compute(cs)] {
+            let opt = Options { mode: mode.clone(), ..Default::default() };
+            let normal = translate(&code, &opt).unwrap();
+            let compact = compact::translate_compact(&code, &opt).unwrap();
+            assert!(compact.complete() && compact.hlsl != normal.hlsl);
+            assert_eq!(translate_as(&code, &opt, CompactCs::Never).map(|(t, c)| (t.hlsl, c)).unwrap(), (normal.hlsl.clone(), false));
+            let always = translate_as(&code, &opt, CompactCs::Always).map(|(t, c)| (t.hlsl, c)).unwrap();
+            assert_eq!(always, if matches!(mode, Mode::Kernel) { (normal.hlsl, false) } else { (compact.hlsl, true) });
+        }
+        // a branch over an instruction the recompiler does not know: the compact form is
+        // incomplete, and the routed translation is `translate`'s
+        let mut code = rdna2::encode("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None).unwrap();
+        code.extend(rdna2::encode("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 0), ("VSRC", 0), ("ATTR", 0)], None).unwrap());
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let opt = Options { mode: Mode::Compute(CsInterface::from_rsrc2([64, 1, 1], 0)), ..Default::default() };
+        let compact =compact::translate_compact(&code, &opt).unwrap();
+        assert!(!compact.complete() && compact.hlsl != translate(&code, &opt).unwrap().hlsl);
+        assert_eq!(translate_as(&code, &opt, CompactCs::Always).map(|(t, c)| (t.hlsl, c)).unwrap(), (translate(&code, &opt).unwrap().hlsl, false));
+    }
 }
 
 #[cfg(test)]

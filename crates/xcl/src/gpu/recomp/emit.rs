@@ -557,6 +557,12 @@ impl Em {
         std::mem::take(&mut self.out)
     }
 
+    /// Number the following temporaries from t1 again; returns how many were made since the
+    /// last reset (the compact form emits each instruction on its own and shares equal texts).
+    pub fn reset_temps(&mut self) -> usize {
+        std::mem::take(&mut self.tmp)
+    }
+
     fn line(&mut self, s: &str) {
         for _ in 0..self.indent {
             self.out.push_str("    ");

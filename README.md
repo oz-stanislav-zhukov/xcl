@@ -153,6 +153,9 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
 - `XCL_DEFER_PRIVATE_HOME_TILES=1` keeps sparse physical pages used only for storage I/O
   in CPU memory. When the title maps those pages at their home address, XCL allocates their
   GPU tiles and uploads the stored data before the next GPU submission. Off by default.
+- `XCL_PSO_FRAME_WAIT_MS=<ms>` caps total time spent waiting on pending compute pipelines across a
+  single frame (off by default). The budget refills on each `PresentX`; pipelines skipped because
+  the frame budget ran out are not marked permanently late and get another chance on the next frame.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation.

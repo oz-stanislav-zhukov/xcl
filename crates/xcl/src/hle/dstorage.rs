@@ -800,6 +800,34 @@ unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
     at != 0 && ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out as *mut c_void, len, &mut done) != 0 && done == len
 }
 
+/// Some titles fill a persistent destination page table after Submit(). A worker can reach
+/// the request first, especially during a burst of streaming. Keep numbers captured at
+/// EnqueueRequest (the caller may have used a stack array), but give missing entries a short
+/// chance to appear in the original table before refusing the request.
+unsafe fn destination_pages_when_ready(ptr: u64, snapshot: &[usize]) -> Vec<usize> {
+    let mut pages = snapshot.to_vec();
+    if !pages.contains(&0) {
+        return pages;
+    }
+    let mut current = vec![0usize; pages.len()];
+    let start = std::time::Instant::now();
+    loop {
+        if !read_own(ptr as usize, current.as_mut_ptr() as *mut u8, std::mem::size_of_val(&*current)) {
+            break;
+        }
+        for (page, (&saved, &now)) in pages.iter_mut().zip(snapshot.iter().zip(&current)) {
+            if saved == 0 {
+                *page = now;
+            }
+        }
+        if !pages.contains(&0) || start.elapsed() >= std::time::Duration::from_millis(50) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    pages
+}
+
 /// Whether `n` bytes at `p` are committed, writable memory.
 fn writable(p: usize, n: usize) -> bool {
     let Some(end) = p.checked_add(n) else { return false };
@@ -946,8 +974,8 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         // entry after EnqueueRequest – its streaming requests were refused by the thousand
         // with page 0.
         let late: Vec<usize>;
-        let pages = if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(pages)) {
-            late = (0..pages.len()).map(|k| if pages[k] != 0 { pages[k] } else { (r.destination as *const usize).add(k).read_unaligned() }).collect();
+        let pages = if pages.contains(&0) {
+            late = destination_pages_when_ready(r.destination, pages);
             &late[..]
         } else {
             pages
@@ -2152,6 +2180,23 @@ mod tests {
             assert_eq!(status_get_hresult(s, 3), S_OK);
             status_release(s);
         }
+    }
+
+    /// A page written after the worker starts the request becomes usable, while a nonzero
+    /// enqueue snapshot is retained even when the caller later changes that table slot.
+    #[test]
+    fn destination_page_wait_keeps_saved_entries_and_finds_late_one() {
+        use std::sync::atomic::AtomicUsize;
+
+        let table = Arc::new([AtomicUsize::new(0), AtomicUsize::new(99)]);
+        let writer = Arc::clone(&table);
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            writer[0].store(1234, Ordering::Release);
+        });
+        let pages = unsafe { destination_pages_when_ready(Arc::as_ptr(&table) as u64, &[0, 77]) };
+        thread.join().unwrap();
+        assert_eq!(pages, [1234, 77], "a saved page number does not follow later table changes");
     }
 
     /// A destination page array whose entry is still 0 at EnqueueRequest and gets its page

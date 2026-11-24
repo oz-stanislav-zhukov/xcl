@@ -3692,13 +3692,30 @@ fn dump_retail_interfaces() {
 /// vertex by vertex (strip winding included), then drawn by the mesh pass-through.
 #[test]
 fn gpu_geometry_mode_es_gs_strip() {
-    if !gpu_ready() || !mesh_ready() {
-        return;
-    }
-    use super::{dxc, mesh_passthrough, GsInterface, IO_GS_PRIMS, IO_GS_VERTICES, MESH_HEADER};
+    geometry_es_gs_strip(false);
+}
+
+/// The same program with branches in the ES (forward) and in the GS (EXEC-zero skip and a
+/// scalar loop): the guarded block chain must keep the phases apart in the split form – the
+/// ES stops at its s_setpc, the GS phase enters at `gs_start` (a structured stretch across the
+/// s_setpc ran the GS in the ES phase and left the GS phase without an entry: empty records).
+#[test]
+fn gpu_geometry_mode_es_gs_strip_with_branches() {
+    geometry_es_gs_strip(true);
+}
+
+/// The geometry program of `gpu_geometry_mode_es_gs_strip`, optionally with branches.
+fn geometry_es_gs_program(branches: bool) -> (Vec<u8>, super::GsInterface) {
+    use super::GsInterface;
     let e = |n: &str, enc: &str, f: &[(&str, u64)], lit: Option<u32>| encode(n, enc, f, lit).unwrap();
     // ES: vertex (v9..v12) → LDS at lane·32, then into the GS
     let mut es = Vec::new();
+    if branches {
+        // if (s3 == 0) skip a s_mov (always taken or not: no effect on the result)
+        es.extend(e("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 3), ("SSRC1", 128)], None));
+        es.extend(e("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None));
+        es.extend(e("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 129)], None));
+    }
     es.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 128)], None));
     es.extend(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", V + 20)], None));
     es.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 21), ("SRC0", 133), ("VSRC1", 20)], None));
@@ -3710,6 +3727,17 @@ fn gpu_geometry_mode_es_gs_strip() {
     let mut gs = Vec::new();
     gs.extend(e("S_BFE_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x80008)));
     gs.extend(e("S_BFM_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 0), ("SSRC1", 128)], None));
+    let mut skip_at = None;
+    if branches {
+        // no primitives: straight to GS done (patched below)
+        skip_at = Some(gs.len());
+        gs.extend(e("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None));
+        // s8 = 2; do { s8 -= 1 } while (s8 != 0)
+        gs.extend(e("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 130)], None));
+        gs.extend(e("S_SUB_U32", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 8), ("SSRC1", 129)], None));
+        gs.extend(e("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 8), ("SSRC1", 128)], None));
+        gs.extend(e("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None));
+    }
     gs.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 128)], None));
     gs.extend(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", V + 20)], None));
     gs.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 130), ("VSRC1", 0)], None));
@@ -3737,6 +3765,10 @@ fn gpu_geometry_mode_es_gs_strip() {
         gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x22)], None)); // emit
     }
     gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x12)], None)); // cut
+    if let Some(at) = skip_at {
+        let off = ((gs.len() - at - 4) / 4) as u64;
+        gs[at..at + 4].copy_from_slice(&e("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", off)], None));
+    }
     gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x3)], None)); // GS done
     gs.extend(e("S_ENDPGM", "ENC_SOPP", &[], None));
 
@@ -3760,6 +3792,29 @@ fn gpu_geometry_mode_es_gs_strip() {
     };
     let mut code = es;
     code.extend_from_slice(&gs);
+    (code, g)
+}
+
+/// Split form with branches: the ES phase ends at the s_setpc and the GS phase has its entry
+/// (`if (pc == gs_start)`), also where no GPU runs the program.
+#[test]
+fn geometry_split_phases_with_branches_have_entry_and_exit() {
+    let (code, g) = geometry_es_gs_program(true);
+    let s = g.gs_start.unwrap();
+    let t = translate(&code, &Options { mode: Mode::Geometry(g.clone()), wave64: true, split_wave64: true, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains(&format!("if (pc == {s}u)")), "{}", t.hlsl);
+    assert!(t.hlsl.contains(&format!("pc = select(xcl_es_phase, 0xFFFFFFFFu, {s}u);")), "{}", t.hlsl);
+    let n = translate(&code, &Options { mode: Mode::Geometry(g), wave64: true, split_wave64: false, ..Default::default() }).unwrap();
+    assert!(n.complete() && !n.hlsl.contains("xcl_es_phase"), "{}", n.hlsl);
+}
+
+fn geometry_es_gs_strip(branches: bool) {
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use super::{dxc, mesh_passthrough, IO_GS_PRIMS, IO_GS_VERTICES, MESH_HEADER};
+    let (code, g) = geometry_es_gs_program(branches);
     let native = translate(&code, &Options { mode: Mode::Geometry(g.clone()), wave64: true, split_wave64: false, ..Default::default() }).unwrap();
     assert!(native.hlsl.contains("[WaveSize(64)]"));
     assert!(!native.hlsl.contains("xcl_es_phase") && !native.hlsl.contains("GroupMemoryBarrierWithGroupSync();\n    if (gi < 32u)"));
